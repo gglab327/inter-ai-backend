@@ -12,11 +12,11 @@ app = FastAPI(title="Inter AI Backend")
 RAW_KEYS = os.getenv("GEMINI_API_KEYS", "")
 API_KEYS = [k.strip() for k in RAW_KEYS.split(",") if k.strip()]
 
-# Актуальные модели Gemini в порядке приоритета
+# Официальные названия моделей Google GenAI API
 MODELS_TO_TRY = [
-    "gemini-2.0-flash",
     "gemini-2.5-flash",
-    "gemini-1.5-flash-latest",
+    "gemini-2.0-flash",
+    "gemini-1.5-flash",
 ]
 
 
@@ -27,7 +27,6 @@ class ChatRequest(BaseModel):
 
 
 def get_gemini_response(contents: list) -> str:
-  """Отправляет запрос в Gemini API с перебором ключей и моделей."""
   if not API_KEYS:
     raise HTTPException(
         status_code=500, detail="Переменная GEMINI_API_KEYS пуста."
@@ -38,12 +37,12 @@ def get_gemini_response(contents: list) -> str:
 
   errors_log = []
 
-  # 1. Перебираем ключи
+  # 1. Перебор ключей
   for key in shuffled_keys:
     try:
       client = genai.Client(api_key=key)
 
-      # 2. Перебираем поддерживаемые модели
+      # 2. Перебор валидных моделей
       for model_name in MODELS_TO_TRY:
         try:
           response = client.models.generate_content(
@@ -52,18 +51,18 @@ def get_gemini_response(contents: list) -> str:
           if response.text:
             return response.text
         except Exception as model_err:
-          errors_log.append(f"[{model_name}]: {str(model_err)}")
+          errors_log.append(f"[{model_name}]: {model_err}")
           continue
 
     except Exception as key_err:
-      errors_log.append(f"[Key error]: {str(key_err)}")
+      errors_log.append(f"[Key error]: {key_err}")
       continue
 
-  # Если ни одна модель не сработала
-  last_err_detail = errors_log[-1] if errors_log else "Неизвестная ошибка"
+  # Если ни одна модель не вернула ответ — выводим полный лог попыток
+  detailed_errors = " | ".join(errors_log)
   raise HTTPException(
       status_code=500,
-      detail=f"Ошибка Gemini API. Последняя ошибка: {last_err_detail}",
+      detail=f"Ошибка Gemini API для всех моделей. Детали: {detailed_errors}",
   )
 
 
@@ -72,7 +71,7 @@ async def chat_endpoint(request: ChatRequest):
   try:
     contents = []
 
-    # 1. Обработка изображения Base64
+    # Обработка изображения Base64
     if request.image_base64 and request.image_base64.strip():
       clean_b64 = request.image_base64.split(",")[-1]
       try:
@@ -87,7 +86,7 @@ async def chat_endpoint(request: ChatRequest):
       )
       contents.append(image_part)
 
-    # 2. Текстовый промпт
+    # Обработка текстового промпта
     user_prompt = request.prompt or request.text
     if not user_prompt:
       user_prompt = (
@@ -98,9 +97,8 @@ async def chat_endpoint(request: ChatRequest):
 
     contents.append(user_prompt)
 
-    # 3. Вызов генерации
+    # Запрос к API
     reply_text = get_gemini_response(contents)
-
     return {"reply": reply_text}
 
   except HTTPException as http_ex:
