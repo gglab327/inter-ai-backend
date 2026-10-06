@@ -1,4 +1,4 @@
 fastapi
 uvicorn
-requests
-pip install google-genai
+google-genai
+pydantic
