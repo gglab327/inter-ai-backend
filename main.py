@@ -1,6 +1,7 @@
 import base64
 import os
 import random
+import time
 from fastapi import FastAPI, HTTPException
 from google import genai
 from google.genai import types
@@ -12,11 +13,9 @@ app = FastAPI(title="Inter AI Backend")
 RAW_KEYS = os.getenv("GEMINI_API_KEYS", "")
 API_KEYS = [k.strip() for k in RAW_KEYS.split(",") if k.strip()]
 
-# Официальные названия моделей Google GenAI API
+# Актуальная модель согласно требованию Google API
 MODELS_TO_TRY = [
-    "gemini-2.5-flash",
-    "gemini-2.0-flash",
-    "gemini-1.5-flash",
+    "gemini-3.8-flash",
 ]
 
 
@@ -27,6 +26,7 @@ class ChatRequest(BaseModel):
 
 
 def get_gemini_response(contents: list) -> str:
+  """Отправляет запрос в Gemini API с ротацией ключей и автоматическими повторами при 503."""
   if not API_KEYS:
     raise HTTPException(
         status_code=500, detail="Переменная GEMINI_API_KEYS пуста."
@@ -37,32 +37,39 @@ def get_gemini_response(contents: list) -> str:
 
   errors_log = []
 
-  # 1. Перебор ключей
+  # 1. Перебор API-ключей
   for key in shuffled_keys:
     try:
       client = genai.Client(api_key=key)
 
-      # 2. Перебор валидных моделей
       for model_name in MODELS_TO_TRY:
-        try:
-          response = client.models.generate_content(
-              model=model_name, contents=contents
-          )
-          if response.text:
-            return response.text
-        except Exception as model_err:
-          errors_log.append(f"[{model_name}]: {model_err}")
-          continue
+        # 2. До 3 повторных попыток на случай временной перегрузки (503 / 429)
+        for attempt in range(3):
+          try:
+            response = client.models.generate_content(
+                model=model_name, contents=contents
+            )
+            if response.text:
+              return response.text
+          except Exception as model_err:
+            err_str = str(model_err)
+            errors_log.append(f"[{model_name} attempt {attempt+1}]: {err_str}")
+
+            # Если модель перегружена (503 / 429), ждем 1 сек и пробуем снова
+            if "503" in err_str or "429" in err_str or "UNAVAILABLE" in err_str:
+              time.sleep(1)
+              continue
+            else:
+              break
 
     except Exception as key_err:
       errors_log.append(f"[Key error]: {key_err}")
       continue
 
-  # Если ни одна модель не вернула ответ — выводим полный лог попыток
   detailed_errors = " | ".join(errors_log)
   raise HTTPException(
       status_code=500,
-      detail=f"Ошибка Gemini API для всех моделей. Детали: {detailed_errors}",
+      detail=f"Ошибка Gemini API. Детали попыток: {detailed_errors}",
   )
 
 
@@ -71,7 +78,7 @@ async def chat_endpoint(request: ChatRequest):
   try:
     contents = []
 
-    # Обработка изображения Base64
+    # 1. Обработка изображения Base64
     if request.image_base64 and request.image_base64.strip():
       clean_b64 = request.image_base64.split(",")[-1]
       try:
@@ -86,7 +93,7 @@ async def chat_endpoint(request: ChatRequest):
       )
       contents.append(image_part)
 
-    # Обработка текстового промпта
+    # 2. Текстовый промпт
     user_prompt = request.prompt or request.text
     if not user_prompt:
       user_prompt = (
@@ -97,7 +104,7 @@ async def chat_endpoint(request: ChatRequest):
 
     contents.append(user_prompt)
 
-    # Запрос к API
+    # 3. Вызов функции генерации
     reply_text = get_gemini_response(contents)
     return {"reply": reply_text}
 
