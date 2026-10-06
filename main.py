@@ -11,7 +11,14 @@ app = FastAPI(title="Inter AI Backend")
 
 RAW_KEYS = os.getenv("GEMINI_API_KEYS", "")
 API_KEYS = [k.strip() for k in RAW_KEYS.split(",") if k.strip()]
-MODEL_NAME = "gemini-3.8-flash"
+
+# Каскадный список моделей: если главная модель перегружена, моментально пробуем следующие
+MODELS_TO_TRY = [
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-1.5-flash",
+    "gemini-1.5-pro",
+]
 
 
 class ChatRequest(BaseModel):
@@ -21,7 +28,7 @@ class ChatRequest(BaseModel):
 
 
 def _sync_generate(client, model, contents):
-  """Синхронный вызов SDK, который будет выполняться в отдельном потоке."""
+  """Синхронный вызов SDK в отдельном потоке."""
   return client.models.generate_content(model=model, contents=contents)
 
 
@@ -35,34 +42,37 @@ async def get_gemini_response(contents: list) -> str:
   random.shuffle(shuffled_keys)
   errors_log = []
 
+  # 1. Перебираем доступные API-ключи
   for key in shuffled_keys:
     try:
       client = genai.Client(api_key=key)
 
-      for attempt in range(2):  # Максимум 2 быстрые попытки
+      # 2. Перебираем модели по очереди (Model Fallback)
+      for model_name in MODELS_TO_TRY:
         try:
-          # Выполняем блокирующий вызов SDK в отдельном потоке
           response = await asyncio.to_thread(
-              _sync_generate, client, MODEL_NAME, contents
+              _sync_generate, client, model_name, contents
           )
           if response and response.text:
             return response.text
         except Exception as model_err:
           err_str = str(model_err)
-          errors_log.append(f"[Attempt {attempt+1}]: {err_str}")
+          errors_log.append(f"[{model_name}]: {err_str}")
 
+          # Если модель перегружена (503/429), мгновенно идем к следующей модели из списка
           if "503" in err_str or "429" in err_str or "UNAVAILABLE" in err_str:
-            await asyncio.sleep(0.5)  # Асинхронная пауза без блокировки сервера
             continue
           else:
-            break
+            continue
+
     except Exception as key_err:
       errors_log.append(f"[Key error]: {key_err}")
       continue
 
   detailed_errors = " | ".join(errors_log)
   raise HTTPException(
-      status_code=500, detail=f"Ошибка Gemini API: {detailed_errors}"
+      status_code=500,
+      detail=f"Все модели перегружены или недоступны. Ошибки: {detailed_errors}",
   )
 
 
@@ -71,6 +81,7 @@ async def chat_endpoint(request: ChatRequest):
   try:
     contents = []
 
+    # Обработка изображения Base64
     if request.image_base64 and request.image_base64.strip():
       clean_b64 = request.image_base64.split(",")[-1]
       try:
@@ -85,6 +96,7 @@ async def chat_endpoint(request: ChatRequest):
       )
       contents.append(image_part)
 
+    # Получение текстового сообщения
     user_prompt = request.prompt or request.text
     if not user_prompt:
       user_prompt = (
@@ -95,6 +107,7 @@ async def chat_endpoint(request: ChatRequest):
 
     contents.append(user_prompt)
 
+    # Генерация ответа
     reply_text = await get_gemini_response(contents)
     return {"reply": reply_text}
 
