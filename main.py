@@ -8,46 +8,42 @@ from pydantic import BaseModel
 
 app = FastAPI(title="Inter AI Backend")
 
-# Считываем список API-ключей из переменной окружения GEMINI_API_KEYS (через запятую)
+# Считываем API-ключи из переменной GEMINI_API_KEYS
 RAW_KEYS = os.getenv("GEMINI_API_KEYS", "")
 API_KEYS = [k.strip() for k in RAW_KEYS.split(",") if k.strip()]
 
-# Список стабильных моделей в порядке приоритета (для обхода ошибки 503)
+# Актуальные модели Gemini в порядке приоритета
 MODELS_TO_TRY = [
     "gemini-2.0-flash",
-    "gemini-1.5-flash",
+    "gemini-2.5-flash",
+    "gemini-1.5-flash-latest",
 ]
 
 
 class ChatRequest(BaseModel):
   image_base64: str | None = None
   prompt: str | None = None
-  text: str | None = None  # Поддержка поля "text" из запроса приложения
+  text: str | None = None
 
 
 def get_gemini_response(contents: list) -> str:
-  """Запрос к Gemini с ротацией ключей и автоматическим переключением моделей при перегрузке (503)."""
+  """Отправляет запрос в Gemini API с перебором ключей и моделей."""
   if not API_KEYS:
     raise HTTPException(
-        status_code=500,
-        detail=(
-            "Переменная GEMINI_API_KEYS не задана или не содержит"
-            " API-ключей."
-        ),
+        status_code=500, detail="Переменная GEMINI_API_KEYS пуста."
     )
 
-  # Перемешиваем ключи для равномерной нагрузки
   shuffled_keys = API_KEYS.copy()
   random.shuffle(shuffled_keys)
 
-  last_error = None
+  errors_log = []
 
   # 1. Перебираем ключи
   for key in shuffled_keys:
     try:
       client = genai.Client(api_key=key)
 
-      # 2. Если модель перегружена (503), переключаемся на резервную модель
+      # 2. Перебираем поддерживаемые модели
       for model_name in MODELS_TO_TRY:
         try:
           response = client.models.generate_content(
@@ -56,21 +52,18 @@ def get_gemini_response(contents: list) -> str:
           if response.text:
             return response.text
         except Exception as model_err:
-          last_error = model_err
-          # Переходим к следующей модели при ошибках 503 / 404
+          errors_log.append(f"[{model_name}]: {str(model_err)}")
           continue
 
     except Exception as key_err:
-      last_error = key_err
+      errors_log.append(f"[Key error]: {str(key_err)}")
       continue
 
-  # Если ни один ключ и ни одна модель не сработали
+  # Если ни одна модель не сработала
+  last_err_detail = errors_log[-1] if errors_log else "Неизвестная ошибка"
   raise HTTPException(
       status_code=500,
-      detail=(
-          "Не удалось получить ответ от Gemini. Все ключи и модели"
-          f" завершились ошибкой: {last_error}"
-      ),
+      detail=f"Ошибка Gemini API. Последняя ошибка: {last_err_detail}",
   )
 
 
@@ -79,7 +72,7 @@ async def chat_endpoint(request: ChatRequest):
   try:
     contents = []
 
-    # 1. Если передана картинка в формате Base64
+    # 1. Обработка изображения Base64
     if request.image_base64 and request.image_base64.strip():
       clean_b64 = request.image_base64.split(",")[-1]
       try:
@@ -94,7 +87,7 @@ async def chat_endpoint(request: ChatRequest):
       )
       contents.append(image_part)
 
-    # 2. Извлекаем текст (поддерживаются и "prompt", и "text")
+    # 2. Текстовый промпт
     user_prompt = request.prompt or request.text
     if not user_prompt:
       user_prompt = (
@@ -105,7 +98,7 @@ async def chat_endpoint(request: ChatRequest):
 
     contents.append(user_prompt)
 
-    # 3. Вызов функции генерации
+    # 3. Вызов генерации
     reply_text = get_gemini_response(contents)
 
     return {"reply": reply_text}
